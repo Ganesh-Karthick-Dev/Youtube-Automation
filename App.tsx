@@ -6,16 +6,32 @@ import {
   generateScriptPackage, 
   generateRefImages, 
   generateSceneImage,
-  generateThumbnail
+  generateThumbnail,
+  generateSpeech,
+  generateSceneVideo
 } from './services/geminiService';
 import { 
   NewsItem, 
   IdeationItem, 
   ScriptPackage, 
   WorkflowState, 
-  ScriptSegment 
+  ScriptSegment,
+  UploadedFile
 } from './types';
 import { MagicIcon, RefreshIcon, DownloadIcon, CopyIcon } from './components/Icons';
+import ImageUploader from './components/ImageUploader';
+
+// Define the AIStudio interface to ensure consistency with global type definitions
+interface AIStudio {
+  hasSelectedApiKey: () => Promise<boolean>;
+  openSelectKey: () => Promise<void>;
+}
+
+declare global {
+  interface Window {
+    aistudio?: AIStudio;
+  }
+}
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -42,6 +58,7 @@ function App() {
   });
   const [loading, setLoading] = useState(false);
   const [news, setNews] = useState<NewsItem[]>([]);
+  const [manualRef, setManualRef] = useState<UploadedFile | null>(null);
 
   useEffect(() => {
     if (state.step === 'NEWS') {
@@ -98,7 +115,7 @@ function App() {
         refImages: urls.map((url, i) => ({ id: `ref-${i}`, url })) 
       }));
     } catch (e) {
-      alert("Failed to generate reference images.");
+      alert("Failed to generate style variations.");
     } finally {
       setLoading(false);
     }
@@ -106,15 +123,37 @@ function App() {
 
   const selectRefImage = async (url: string) => {
     setState(prev => ({ ...prev, step: 'PRODUCTION', selectedRefImageUrl: url }));
-    
-    // Generate Thumbnail and scenes in parallel/sequence
-    generateThumbnailAndScenes(url);
+    generateProductionAssets(url);
   };
 
-  const generateThumbnailAndScenes = async (refUrl: string) => {
+  const handleManualRefSelect = (file: UploadedFile) => {
+    setManualRef(file);
+    selectRefImage(file.base64);
+  };
+
+  const generateProductionAssets = async (refUrl: string) => {
     if (!state.scriptPackage) return;
     
-    // 1. Generate Thumbnail
+    // 1. Generate Audio Narration
+    setState(prev => prev.scriptPackage ? ({
+      ...prev,
+      scriptPackage: { ...prev.scriptPackage, isAudioGenerating: true }
+    }) : prev);
+
+    generateSpeech(state.scriptPackage.fullScriptPara).then(audioUrl => {
+      setState(prev => prev.scriptPackage ? ({
+        ...prev,
+        scriptPackage: { ...prev.scriptPackage, audioUrl, isAudioGenerating: false }
+      }) : prev);
+    }).catch(err => {
+      console.error("Audio failed", err);
+      setState(prev => prev.scriptPackage ? ({
+        ...prev,
+        scriptPackage: { ...prev.scriptPackage, isAudioGenerating: false }
+      }) : prev);
+    });
+
+    // 2. Generate Thumbnail
     try {
       const thumbUrl = await generateThumbnail(state.scriptPackage.thumbnailPrompt);
       setState(prev => prev.scriptPackage ? ({
@@ -123,7 +162,7 @@ function App() {
       }) : prev);
     } catch (e) { console.error("Thumbnail failed", e); }
 
-    // 2. Generate All Scenes
+    // 3. Generate All Scenes
     const segments = [...state.scriptPackage.segments];
     for (let i = 0; i < segments.length; i++) {
       updateSegment(segments[i].id, { isGenerating: true });
@@ -133,6 +172,29 @@ function App() {
       } catch (e) {
         updateSegment(segments[i].id, { isGenerating: false });
       }
+    }
+  };
+
+  const animateScene = async (segment: ScriptSegment) => {
+    if (!segment.imageUrl) return;
+    const hasKey = await window.aistudio?.hasSelectedApiKey();
+    if (!hasKey) {
+      setState(prev => ({ ...prev, needsApiKey: true }));
+      return;
+    }
+
+    updateSegment(segment.id, { isVideoGenerating: true });
+    try {
+      const videoUrl = await generateSceneVideo(segment.imageUrl, segment.imagePrompt);
+      updateSegment(segment.id, { videoUrl, isVideoGenerating: false });
+    } catch (e: any) {
+      console.error("Animation failed", e);
+      if (e.message?.includes("Requested entity was not found")) {
+        setState(prev => ({ ...prev, needsApiKey: true }));
+      } else {
+        alert("Animation failed. Check API key billing.");
+      }
+      updateSegment(segment.id, { isVideoGenerating: false });
     }
   };
 
@@ -154,7 +216,7 @@ function App() {
     updateSegment(segment.id, { isGenerating: true });
     try {
       const imageUrl = await generateSceneImage(state.selectedRefImageUrl, segment.imagePrompt);
-      updateSegment(segment.id, { imageUrl, isGenerating: false });
+      updateSegment(segment.id, { imageUrl, isGenerating: false, videoUrl: null });
     } catch (e) {
       updateSegment(segment.id, { isGenerating: false });
     }
@@ -162,30 +224,33 @@ function App() {
 
   const downloadProduction = async () => {
     if (!state.scriptPackage) return;
-    // Download Thumbnail
-    if (state.scriptPackage.thumbnailUrl) {
-      const tLink = document.createElement('a');
-      tLink.href = state.scriptPackage.thumbnailUrl;
-      tLink.download = 'youtube-thumbnail.png';
-      tLink.click();
+    const downloads = [];
+    if (state.scriptPackage.audioUrl) downloads.push({ url: state.scriptPackage.audioUrl, name: 'narration.wav' });
+    if (state.scriptPackage.thumbnailUrl) downloads.push({ url: state.scriptPackage.thumbnailUrl, name: 'thumbnail.png' });
+    state.scriptPackage.segments.forEach(seg => {
+      if (seg.videoUrl) downloads.push({ url: seg.videoUrl, name: `motion-${seg.timestamp.replace(':', '-')}.mp4` });
+      else if (seg.imageUrl) downloads.push({ url: seg.imageUrl, name: `scene-${seg.timestamp.replace(':', '-')}.png` });
+    });
+
+    for (const d of downloads) {
+      const link = document.createElement('a');
+      link.href = d.url;
+      link.download = d.name;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      await new Promise(r => setTimeout(r, 600));
     }
-    // Download Segments
-    for (const seg of state.scriptPackage.segments) {
-      if (seg.imageUrl) {
-        const link = document.createElement('a');
-        link.href = seg.imageUrl;
-        link.download = `scene-${seg.timestamp.replace(':', '-')}.png`;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        await new Promise(r => setTimeout(r, 300));
-      }
-    }
+  };
+
+  const openApiKeyDialog = async () => {
+    await window.aistudio?.openSelectKey();
+    setState(prev => ({ ...prev, needsApiKey: false }));
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 pb-20">
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur sticky top-0 z-50">
+      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur sticky top-0_z-50">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-red-600 rounded-lg flex items-center justify-center font-bold text-white italic shadow-lg shadow-red-900/20">S</div>
@@ -200,7 +265,22 @@ function App() {
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-10">
-        {/* Step 1: News Discovery */}
+        {state.needsApiKey && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-black/80 backdrop-blur-sm">
+            <div className="bg-slate-900 border border-slate-800 p-10 rounded-[2rem] max-w-md w-full text-center space-y-6 shadow-2xl">
+              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-full flex items-center justify-center mx-auto text-amber-500">
+                 <MagicIcon />
+              </div>
+              <h3 className="text-2xl font-black">Paid API Key Required</h3>
+              <p className="text-slate-400 text-sm">Veo motion generation requires a paid Google Cloud project key with billing enabled.</p>
+              <div className="space-y-4">
+                <button onClick={openApiKeyDialog} className="w-full py-4 bg-white text-black font-black uppercase tracking-widest rounded-2xl active:scale-95 transition-transform">Select Paid Key</button>
+                <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" className="block text-xs text-slate-500 underline">Learn about billing</a>
+              </div>
+            </div>
+          </div>
+        )}
+
         {state.step === 'NEWS' && (
           <section className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <div className="max-w-2xl mx-auto text-center space-y-4">
@@ -209,10 +289,7 @@ function App() {
             </div>
             {loading ? (
               <div className="flex flex-col items-center py-24 gap-6">
-                <div className="relative">
-                   <div className="w-16 h-16 border-4 border-slate-800 rounded-full"></div>
-                   <div className="absolute inset-0 w-16 h-16 border-4 border-red-500 border-t-transparent rounded-full animate-spin"></div>
-                </div>
+                <div className="w-16 h-16 border-4 border-red-500 border-t-transparent rounded-full animate-spin"></div>
                 <p className="animate-pulse text-slate-400 font-medium tracking-wide">QUERYING TECH NEWS ARCHIVES...</p>
               </div>
             ) : (
@@ -228,7 +305,7 @@ function App() {
                     </div>
                     <h3 className="text-xl font-bold group-hover:text-red-400 transition-colors pr-10">{item.title}</h3>
                     <p className="text-sm text-slate-400 mt-2 line-clamp-2 leading-relaxed">{item.snippet}</p>
-                    <div className="mt-4 text-[10px] text-slate-600 font-mono">{item.url}</div>
+                    <div className="mt-4 text-[10px] text-slate-600 font-mono truncate">{item.url}</div>
                   </button>
                 ))}
                 <button onClick={loadNews} className="text-xs text-slate-500 hover:text-white underline mx-auto mt-6">Scan Again</button>
@@ -237,7 +314,6 @@ function App() {
           </section>
         )}
 
-        {/* Step 2: Ideation */}
         {state.step === 'IDEATION' && (
           <section className="space-y-12 animate-in slide-in-from-right duration-500">
              <div className="text-center space-y-4">
@@ -271,7 +347,6 @@ function App() {
           </section>
         )}
 
-        {/* Step 3: Script Review */}
         {state.step === 'SCRIPT' && state.scriptPackage && (
           <section className="max-w-5xl mx-auto space-y-10 animate-in slide-in-from-right duration-500">
              <div className="bg-slate-900 border border-slate-800 rounded-[2rem] overflow-hidden shadow-2xl">
@@ -318,7 +393,10 @@ function App() {
                       </div>
                     </div>
                     <div className="p-6 bg-slate-950/50 rounded-2xl border border-slate-800">
-                      <h3 className="font-black uppercase text-[10px] text-slate-500 tracking-widest mb-3">Long-form Script</h3>
+                      <div className="flex justify-between items-center mb-3">
+                         <h3 className="font-black uppercase text-[10px] text-slate-500 tracking-widest">Long-form Script</h3>
+                         <CopyButton text={state.scriptPackage.fullScriptPara} />
+                      </div>
                       <p className="text-xs text-slate-400 leading-relaxed font-serif italic">{state.scriptPackage.fullScriptPara}</p>
                     </div>
                   </div>
@@ -332,20 +410,25 @@ function App() {
                     className="px-10 py-4 bg-red-600 hover:bg-red-500 text-white rounded-2xl font-black uppercase tracking-widest flex items-center gap-3 transition-all disabled:opacity-50 shadow-xl shadow-red-900/20 active:scale-95"
                    >
                      {loading ? <div className="w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin"></div> : <MagicIcon />}
-                     Initiate Style Selection
+                     Initiate Visual Engine
                    </button>
                 </div>
              </div>
           </section>
         )}
 
-        {/* Step 4: Ref Image Selection */}
         {state.step === 'REF_IMAGE' && (
           <section className="space-y-12 animate-in zoom-in duration-500">
             <div className="max-w-3xl mx-auto text-center space-y-4">
-              <h2 className="text-4xl font-black tracking-tight">Style Identity</h2>
-              <p className="text-slate-400 text-lg">Select the visual DNA for this production. All scenes will adapt to this chosen reference image to ensure professional consistency.</p>
+              <h2 className="text-4xl font-black tracking-tight">Reference Architecture</h2>
+              <p className="text-slate-400 text-lg">Select a generated style or upload your own vision.</p>
             </div>
+            
+            <div className="max-w-xl mx-auto mb-16">
+              <h3 className="text-xs font-black uppercase tracking-widest text-slate-600 mb-4 text-center">Manual Upload</h3>
+              <ImageUploader onImageSelected={handleManualRefSelect} selectedImage={manualRef} />
+            </div>
+
             <div className="grid grid-cols-2 md:grid-cols-4 gap-8">
               {state.refImages.map(img => (
                 <button 
@@ -363,137 +446,109 @@ function App() {
           </section>
         )}
 
-        {/* Step 5: Final Production Studio */}
         {state.step === 'PRODUCTION' && state.scriptPackage && (
           <section className="space-y-12 animate-in fade-in duration-1000">
-            <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6">
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-end gap-6 border-b border-slate-800 pb-8">
               <div className="space-y-2">
-                <h2 className="text-4xl font-black tracking-tight">Director's Studio</h2>
-                <p className="text-slate-400">Review, copy, and export your finalized high-conversion Short.</p>
+                <h2 className="text-4xl font-black tracking-tight leading-tight">Director's Studio</h2>
+                <p className="text-slate-400">Review, animate, and finalize your production.</p>
               </div>
-              <div className="flex gap-4">
-                <button 
-                  onClick={downloadProduction}
-                  className="px-8 py-3 bg-green-600 hover:bg-green-500 rounded-xl font-black text-xs uppercase tracking-widest flex items-center gap-2 shadow-lg shadow-green-900/20 active:scale-95 transition-all"
-                >
-                  <DownloadIcon /> Export Assets
-                </button>
-              </div>
+              <button 
+                onClick={downloadProduction}
+                className="px-8 py-3 bg-green-600 hover:bg-green-500 rounded-xl font-black text-xs uppercase tracking-widest flex items-center gap-2 shadow-lg active:scale-95 transition-all"
+              >
+                <DownloadIcon /> Export All Assets
+              </button>
             </div>
 
-            {/* Final Overview Hub */}
             <div className="grid lg:grid-cols-3 gap-8">
-              {/* Left Column: Metadata Copy Hub */}
               <div className="lg:col-span-1 space-y-6">
-                <div className="bg-slate-900/60 border border-slate-800 p-8 rounded-[2rem] space-y-8 sticky top-24">
-                   <h3 className="font-black text-xs uppercase tracking-widest text-red-500 flex items-center justify-between">
-                     Copy Hub
-                     <span className="text-[10px] text-slate-600 font-mono">YT SHORT DATA</span>
-                   </h3>
+                <div className="bg-slate-900/60 border border-slate-800 p-8 rounded-[2rem] space-y-8 sticky top-24 backdrop-blur">
+                   <h3 className="font-black text-xs uppercase tracking-widest text-red-500 flex items-center justify-between">Distribution Hub</h3>
                    
                    <div className="space-y-4">
                      <div className="p-4 bg-slate-950 rounded-xl border border-slate-800">
-                        <div className="flex justify-between items-center mb-1">
-                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Title</span>
-                          <CopyButton text={state.scriptPackage.title} />
-                        </div>
+                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-2 block">Audio Narration</span>
+                        {state.scriptPackage.isAudioGenerating ? (
+                           <div className="flex items-center gap-3 py-2 animate-pulse">
+                              <div className="w-4 h-4 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
+                              <span className="text-[10px] font-mono text-slate-500">VOICING...</span>
+                           </div>
+                        ) : state.scriptPackage.audioUrl ? (
+                           <audio controls className="w-full h-10 -mx-4 scale-90">
+                              <source src={state.scriptPackage.audioUrl} type="audio/wav" />
+                           </audio>
+                        ) : null}
+                     </div>
+
+                     <div className="p-4 bg-slate-950 rounded-xl border border-slate-800 relative group">
+                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-1 block">Title</span>
                         <p className="text-sm font-bold line-clamp-2">{state.scriptPackage.title}</p>
+                        <div className="absolute top-2 right-2"><CopyButton text={state.scriptPackage.title} /></div>
                      </div>
 
-                     <div className="p-4 bg-slate-950 rounded-xl border border-slate-800">
-                        <div className="flex justify-between items-center mb-1">
-                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Description</span>
-                          <CopyButton text={state.scriptPackage.description} />
+                     <div className="space-y-4 pt-4 border-t border-slate-800">
+                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest block mb-2">YT Thumbnail (16:9)</span>
+                        <div className="aspect-video bg-slate-950 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center">
+                          {state.scriptPackage.thumbnailUrl ? (
+                            <img src={state.scriptPackage.thumbnailUrl} className="w-full h-full object-cover" />
+                          ) : <div className="w-6 h-6 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>}
                         </div>
-                        <p className="text-[11px] text-slate-400 line-clamp-3 leading-relaxed">{state.scriptPackage.description}</p>
                      </div>
-
-                     <div className="p-4 bg-slate-950 rounded-xl border border-slate-800">
-                        <div className="flex justify-between items-center mb-1">
-                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Tags</span>
-                          <CopyButton text={state.scriptPackage.tags.join(', ')} />
-                        </div>
-                        <p className="text-[11px] text-blue-400 font-mono line-clamp-2">{state.scriptPackage.tags.join(', ')}</p>
-                     </div>
-
-                     <div className="p-4 bg-slate-950 rounded-xl border border-slate-800">
-                        <div className="flex justify-between items-center mb-1">
-                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Full Script Text</span>
-                          <CopyButton text={state.scriptPackage.fullScriptPara} />
-                        </div>
-                        <p className="text-[11px] text-slate-500 italic line-clamp-4 leading-loose">{state.scriptPackage.fullScriptPara}</p>
-                     </div>
-                   </div>
-
-                   {/* Thumbnail Preview in the Hub */}
-                   <div className="space-y-4 pt-4 border-t border-slate-800">
-                      <div className="flex justify-between items-center">
-                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">YouTube Thumbnail</span>
-                        {state.scriptPackage.thumbnailUrl && (
-                          <button 
-                            onClick={() => {
-                              const l = document.createElement('a');
-                              l.href = state.scriptPackage!.thumbnailUrl!;
-                              l.download = 'thumbnail.png';
-                              l.click();
-                            }}
-                            className="p-1.5 text-slate-400 hover:text-white"
-                          >
-                            <DownloadIcon />
-                          </button>
-                        )}
-                      </div>
-                      <div className="aspect-video bg-slate-950 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center relative group">
-                        {state.scriptPackage.thumbnailUrl ? (
-                          <img src={state.scriptPackage.thumbnailUrl} className="w-full h-full object-cover" />
-                        ) : (
-                          <div className="flex flex-col items-center gap-2">
-                             <div className="w-6 h-6 border-2 border-red-500 border-t-transparent rounded-full animate-spin"></div>
-                             <span className="text-[10px] font-mono text-slate-700">RENDERING 4K THUMBNAIL...</span>
-                          </div>
-                        )}
-                      </div>
                    </div>
                 </div>
               </div>
 
-              {/* Right Column: Storyboard Production */}
               <div className="lg:col-span-2 space-y-8">
-                <h3 className="font-black text-sm uppercase tracking-[0.2em] text-slate-500 border-b border-slate-800 pb-4">Storyboard Timeline</h3>
+                <h3 className="font-black text-sm uppercase tracking-[0.2em] text-slate-500 border-b border-slate-800 pb-4">Cinematic Storyboard</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                    {state.scriptPackage.segments.map((seg, i) => (
-                     <div key={seg.id} className="flex flex-col bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden group shadow-xl">
+                     <div key={seg.id} className="flex flex-col bg-slate-900 border border-slate-800 rounded-3xl overflow-hidden group shadow-xl transition-all hover:border-slate-700">
                        <div className="relative aspect-[9/16] bg-slate-950 flex items-center justify-center">
-                          {seg.isGenerating ? (
-                            <div className="flex flex-col items-center gap-3">
-                               <div className="w-10 h-10 border-4 border-red-500 border-t-transparent rounded-full animate-spin"></div>
-                               <span className="text-[10px] font-black uppercase tracking-widest text-slate-600 animate-pulse">Rendering Part {i+1}/10</span>
+                          {seg.isVideoGenerating ? (
+                            <div className="flex flex-col items-center gap-4 text-center p-8">
+                               <div className="w-12 h-12 border-4 border-red-500 border-t-transparent rounded-full animate-spin shadow-lg shadow-red-500/20"></div>
+                               <span className="text-[10px] font-black uppercase tracking-widest text-slate-500 animate-pulse">Veo Synthesizing Motion...</span>
+                               <p className="text-[9px] text-slate-600 font-mono mt-2 leading-relaxed italic">Synthesizing 3s realistic motion based on prompt & script...</p>
                             </div>
+                          ) : seg.videoUrl ? (
+                             <video src={seg.videoUrl} className="w-full h-full object-cover" controls autoPlay loop muted playsInline />
+                          ) : seg.isGenerating ? (
+                            <div className="w-10 h-10 border-4 border-slate-800 border-t-red-500 rounded-full animate-spin"></div>
                           ) : seg.imageUrl ? (
                             <>
                               <img src={seg.imageUrl} className="w-full h-full object-cover" />
-                              <button 
-                                onClick={() => regenerateScene(seg)}
-                                className="absolute top-4 right-4 p-3 bg-black/60 backdrop-blur rounded-2xl opacity-0 group-hover:opacity-100 hover:bg-red-600 transition-all text-white shadow-2xl"
-                                title="Regenerate Scene"
-                              >
-                                <RefreshIcon />
-                              </button>
+                              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-4">
+                                <button 
+                                  onClick={() => animateScene(seg)}
+                                  className="px-6 py-3 bg-red-600 text-white rounded-full font-black text-[10px] uppercase tracking-widest shadow-xl flex items-center gap-2 hover:bg-red-500 active:scale-95 transition-all"
+                                >
+                                  <MagicIcon /> Animate with Veo
+                                </button>
+                                <button 
+                                  onClick={() => regenerateScene(seg)}
+                                  className="text-white/60 hover:text-white text-[10px] font-bold uppercase tracking-widest flex items-center gap-2"
+                                >
+                                  <RefreshIcon /> Reset Scene
+                                </button>
+                              </div>
                             </>
-                          ) : (
-                            <div className="text-slate-800 scale-150"><MagicIcon /></div>
-                          )}
-                          <div className="absolute bottom-6 left-6 right-6 p-4 bg-black/70 backdrop-blur-md rounded-2xl border border-white/10 shadow-2xl">
-                            <span className="text-[10px] text-red-500 font-black tracking-widest block mb-2 uppercase">Part {i+1} • 00:{seg.timestamp}</span>
-                            <p className="text-xs text-white leading-relaxed font-medium">"{seg.text}"</p>
+                          ) : <MagicIcon />}
+                          
+                          <div className="absolute bottom-6 left-6 right-6 p-5 bg-black/80 backdrop-blur-2xl rounded-2xl border border-white/5 shadow-2xl">
+                            <div className="flex justify-between items-center mb-2">
+                               <span className="text-[10px] text-red-500 font-black tracking-widest uppercase">Part {i+1} • 00:{seg.timestamp}</span>
+                               <div className={`w-1.5 h-1.5 rounded-full ${seg.videoUrl ? 'bg-green-500' : 'bg-slate-700'}`}></div>
+                            </div>
+                            <p className="text-xs text-white leading-relaxed font-bold italic">"{seg.text}"</p>
                           </div>
                        </div>
-                       <div className="p-6 bg-slate-900/80">
+                       <div className="p-6 bg-slate-900/80 border-t border-slate-800">
                           <div className="flex justify-between items-center mb-1">
-                            <span className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Visual Prompt</span>
+                            <span className="text-[10px] text-slate-500 font-black uppercase tracking-widest">Visual Logic</span>
                             <CopyButton text={seg.imagePrompt} />
                           </div>
-                          <p className="text-[10px] text-slate-500 line-clamp-2 italic font-serif">"{seg.imagePrompt}"</p>
+                          <p className="text-[10px] text-slate-500 line-clamp-2 italic font-mono leading-tight">"{seg.imagePrompt}"</p>
                        </div>
                      </div>
                    ))}
@@ -504,12 +559,11 @@ function App() {
         )}
       </main>
 
-      {/* Breadcrumb Stepper */}
-      <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-slate-900/80 backdrop-blur-xl border border-white/10 px-6 py-3 rounded-full shadow-2xl z-50">
+      <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-slate-900/90 backdrop-blur-2xl border border-white/10 px-8 py-4 rounded-full shadow-2xl z-50">
         {['NEWS', 'IDEATION', 'SCRIPT', 'REF_IMAGE', 'PRODUCTION'].map((step, idx) => (
           <React.Fragment key={step}>
             <div 
-              className={`w-3 h-3 rounded-full transition-all duration-500 ${
+              className={`w-3 h-3 rounded-full transition-all duration-700 ${
                 state.step === step ? 'bg-red-500 scale-125 shadow-[0_0_15px_rgba(239,68,68,0.5)]' : 
                 ['NEWS', 'IDEATION', 'SCRIPT', 'REF_IMAGE', 'PRODUCTION'].indexOf(state.step) > idx ? 'bg-slate-500' : 'bg-slate-800'
               }`}
@@ -517,7 +571,7 @@ function App() {
             {idx < 4 && <div className="w-4 h-[1px] bg-slate-800" />}
           </React.Fragment>
         ))}
-        <span className="ml-4 text-[10px] font-black uppercase tracking-widest text-slate-400">{state.step}</span>
+        <span className="ml-4 text-[10px] font-black uppercase tracking-[0.3em] text-slate-500">{state.step}</span>
       </div>
     </div>
   );

@@ -18,7 +18,9 @@ export interface ScriptSegment {
   text: string;
   imagePrompt: string;
   imageUrl?: string | null;
+  videoUrl?: string | null;
   isGenerating?: boolean;
+  isVideoGenerating?: boolean;
 }
 
 export interface ScriptPackage {
@@ -28,6 +30,8 @@ export interface ScriptPackage {
   cta: string;
   thumbnailPrompt: string;
   thumbnailUrl?: string;
+  audioUrl?: string;
+  isAudioGenerating?: boolean;
   mainRefPrompt: string;
   fullScriptPara: string;
   segments: ScriptSegment[];
@@ -41,18 +45,20 @@ export interface WorkflowState {
   scriptPackage?: ScriptPackage;
   refImages: { id: string; url: string }[];
   selectedRefImageUrl?: string;
-}
-
-export interface GeneratedImage {
-  id: string;
-  prompt: string;
-  imageUrl: string | null;
-  status: 'pending' | 'success' | 'error';
-  errorMessage?: string;
+  needsApiKey?: boolean;
 }
 
 export interface UploadedFile {
   base64: string;
   mimeType: string;
   previewUrl: string;
+}
+
+// Added GeneratedImage interface to fix import error in GeneratedGallery.tsx
+export interface GeneratedImage {
+  id: string;
+  prompt: string;
+  imageUrl?: string;
+  status: 'pending' | 'success' | 'error';
+  errorMessage?: string;
 }
