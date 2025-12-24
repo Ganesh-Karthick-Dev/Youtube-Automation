@@ -1,5 +1,6 @@
 
 import React, { useState, useEffect } from 'react';
+import JSZip from 'jszip';
 import { 
   fetchTrendingNews, 
   generateIdeation, 
@@ -21,15 +22,13 @@ import {
 import { MagicIcon, RefreshIcon, DownloadIcon, CopyIcon } from './components/Icons';
 import ImageUploader from './components/ImageUploader';
 
-// Define the AIStudio interface to ensure consistency with global type definitions
-interface AIStudio {
-  hasSelectedApiKey: () => Promise<boolean>;
-  openSelectKey: () => Promise<void>;
-}
-
+// Use declare global to extend Window interface without causing duplicate declaration errors
 declare global {
   interface Window {
-    aistudio?: AIStudio;
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
   }
 }
 
@@ -57,6 +56,7 @@ function App() {
     refImages: []
   });
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [manualRef, setManualRef] = useState<UploadedFile | null>(null);
 
@@ -224,22 +224,68 @@ function App() {
 
   const downloadProduction = async () => {
     if (!state.scriptPackage) return;
-    const downloads = [];
-    if (state.scriptPackage.audioUrl) downloads.push({ url: state.scriptPackage.audioUrl, name: 'narration.wav' });
-    if (state.scriptPackage.thumbnailUrl) downloads.push({ url: state.scriptPackage.thumbnailUrl, name: 'thumbnail.png' });
-    state.scriptPackage.segments.forEach(seg => {
-      if (seg.videoUrl) downloads.push({ url: seg.videoUrl, name: `motion-${seg.timestamp.replace(':', '-')}.mp4` });
-      else if (seg.imageUrl) downloads.push({ url: seg.imageUrl, name: `scene-${seg.timestamp.replace(':', '-')}.png` });
-    });
+    setExporting(true);
+    
+    try {
+      const zip = new JSZip();
+      
+      const fetchAsBlob = async (url: string) => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Failed to fetch ${url}`);
+        return await response.blob();
+      };
 
-    for (const d of downloads) {
-      const link = document.createElement('a');
-      link.href = d.url;
-      link.download = d.name;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      await new Promise(r => setTimeout(r, 600));
+      // 1. Add Audio
+      if (state.scriptPackage.audioUrl) {
+        const audioBlob = await fetchAsBlob(state.scriptPackage.audioUrl);
+        zip.file("narration.wav", audioBlob);
+      }
+
+      // 2. Add Thumbnail
+      if (state.scriptPackage.thumbnailUrl) {
+        const thumbBlob = await fetchAsBlob(state.scriptPackage.thumbnailUrl);
+        zip.file("thumbnail.png", thumbBlob);
+      }
+
+      // 3. Add Segments (Images or Videos)
+      const segmentPromises = state.scriptPackage.segments.map(async (seg, i) => {
+        const index = (i + 1).toString().padStart(2, '0');
+        if (seg.videoUrl) {
+          const videoBlob = await fetchAsBlob(seg.videoUrl);
+          zip.file(`scenes/segment_${index}_motion.mp4`, videoBlob);
+        } else if (seg.imageUrl) {
+          const imageBlob = await fetchAsBlob(seg.imageUrl);
+          zip.file(`scenes/segment_${index}_frame.png`, imageBlob);
+        }
+      });
+      await Promise.all(segmentPromises);
+
+      // 4. Add Metadata & Script text
+      const meta = {
+        title: state.scriptPackage.title,
+        description: state.scriptPackage.description,
+        tags: state.scriptPackage.tags,
+        script: state.scriptPackage.fullScriptPara,
+        cta: state.scriptPackage.cta,
+        productionDate: new Date().toISOString()
+      };
+      zip.file("production_metadata.json", JSON.stringify(meta, null, 2));
+      zip.file("full_script.txt", state.scriptPackage.fullScriptPara);
+
+      // 5. Generate and download ZIP
+      const zipContent = await zip.generateAsync({ type: "blob" });
+      const downloadLink = document.createElement('a');
+      downloadLink.href = URL.createObjectURL(zipContent);
+      downloadLink.download = `ShortsAI_Production_${state.scriptPackage.title.replace(/\s+/g, '_')}.zip`;
+      document.body.appendChild(downloadLink);
+      downloadLink.click();
+      document.body.removeChild(downloadLink);
+      
+    } catch (err) {
+      console.error("ZIP Generation error:", err);
+      alert("Failed to bundle assets into a ZIP file. Try individual exports.");
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -250,7 +296,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 pb-20">
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur sticky top-0_z-50">
+      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 bg-red-600 rounded-lg flex items-center justify-center font-bold text-white italic shadow-lg shadow-red-900/20">S</div>
@@ -455,9 +501,15 @@ function App() {
               </div>
               <button 
                 onClick={downloadProduction}
-                className="px-8 py-3 bg-green-600 hover:bg-green-500 rounded-xl font-black text-xs uppercase tracking-widest flex items-center gap-2 shadow-lg active:scale-95 transition-all"
+                disabled={exporting}
+                className="px-8 py-4 bg-green-600 hover:bg-green-500 rounded-2xl font-black text-xs uppercase tracking-widest flex items-center gap-3 shadow-lg active:scale-95 transition-all disabled:opacity-50"
               >
-                <DownloadIcon /> Export All Assets
+                {exporting ? (
+                  <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin"></div>
+                ) : (
+                  <DownloadIcon />
+                )}
+                {exporting ? "Bundling ZIP..." : "Export Assets (ZIP)"}
               </button>
             </div>
 
